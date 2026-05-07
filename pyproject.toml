@@ -1,0 +1,12 @@
+[project]
+name = "earlyliverfailureprediction"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "keras>=3.14.0",
+    "matplotlib>=3.10.9",
+    "opencv-python>=4.13.0.92",
+    "tensorflow>=2.21.0",
+]

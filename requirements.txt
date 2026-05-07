@@ -1,0 +1,13 @@
+tensorflow>=2.13.0
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+flask
+scipy
+joblib
+imbalanced-learn
+xgboost
+catboost
+lightgbm
