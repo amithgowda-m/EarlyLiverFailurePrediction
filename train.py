@@ -18,8 +18,8 @@ warnings.filterwarnings('ignore')
 
 def main():
     print("Loading datasets...")
-    labs_df = pd.read_csv('labs_features.csv')
-    targets_df = pd.read_csv('patient_targets.csv')
+    df_features = pd.read_csv('./Ds/labs_features.csv')
+    df_targets = pd.read_csv('./Ds/patient_targets.csv')
 
     target_tests = [
         "Bilirubin, Total", "INR(PT)", "Creatinine", 
@@ -28,16 +28,8 @@ def main():
     ]
 
     print("Formatting for tsfresh...")
-    labs_filtered = labs_df[labs_df['lab_test_name'].isin(target_tests)].copy()
+    labs_filtered = df_features[df_features['lab_test_name'].isin(target_tests)].copy()
     
-    # Keeping to 500 subjects to allow EfficientFCParameters to run in seconds 
-    # instead of hours on the backend, preserving development speed.
-    np.random.seed(42)
-    all_subjects = labs_filtered['subject_id'].unique()
-    if len(all_subjects) > 500:
-        sampled_subjects = np.random.choice(all_subjects, 500, replace=False)
-        labs_filtered = labs_filtered[labs_filtered['subject_id'].isin(sampled_subjects)]
-        
     labs_filtered['charttime'] = pd.to_datetime(labs_filtered['charttime'])
     labs_filtered = labs_filtered.dropna(subset=['valuenum'])
 
@@ -54,7 +46,7 @@ def main():
     )
 
     print("Merging with targets...")
-    merged = targets_df.merge(X_extracted, left_on='subject_id', right_index=True, how='inner')
+    merged = df_targets.merge(X_extracted, left_on='subject_id', right_index=True, how='inner')
 
     le = LabelEncoder()
     if merged['gender'].isnull().any():

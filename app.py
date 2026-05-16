@@ -1,343 +1,454 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-import shap
-import matplotlib.pyplot as plt
-import joblib
-from tsfresh import extract_features
-from tsfresh.feature_extraction.settings import from_columns
-from tsfresh.utilities.dataframe_functions import impute
-import io
+"""
+HepSense -- Modular CDSS Integrator (app.py)
+============================================
+The "Chief Medical Officer" script. Integrates three independent expert modules
+at the DECISION level (not feature level) to avoid Frankenstein data fusion.
+
+Experts:
+    1. Vision Expert   -- DANN EfficientNet-B0 (PyTorch)  -> Fibrosis stage F0-F4
+    2. Clinical Expert -- XGBoost (hepsense_clinical_xgboost_v1.joblib) -> Decompensation risk
+    3. Temporal Expert -- XGBoost (hepsense_temporal_xgboost_v1.joblib) -> Trajectory forecast
+
+Final output: Rule-Based Integration Engine combining all expert opinions into
+a unified HepSense Combined Recommendation.
+
+Designed for easy Streamlit frontend integration.
+"""
+
+import os
+import json
 import warnings
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
 
-warnings.filterwarnings('ignore')
+# PyTorch imports for Vision module
+import torch
 
-# -----------------------------------------------------------------------------
-# CLINICAL TRANSLATION DICTIONARY
-# -----------------------------------------------------------------------------
-CLINICAL_MAP = {
-    'time_reversal_asymmetry_statistic': 'Acute Trajectory Volatility',
-    'linear_trend': 'Linear Degradation Trend',
-    'energy_ratio_by_chunks': 'Intermittent Spikes',
-    'fft_coefficient': 'Cyclical Fluctuation',
-    'quantile': 'Distribution Shift',
-    'cwt_coefficients': 'Wavelet Shift',
-    'ar_coefficient': 'Autoregressive Drift',
-    'agg_linear_trend': 'Aggregated Trend',
-    'spkt_welch_density': 'Spectral Density',
-    'variance': 'Variance',
-    'standard_deviation': 'Standard Deviation',
-    'maximum': 'Maximum Level',
-    'minimum': 'Minimum Level',
-    'mean': 'Average Level',
-    'median': 'Median Level',
-    'sum_values': 'Cumulative Burden',
-    'abs_energy': 'Absolute Energy',
-    'mean_abs_change': 'Mean Absolute Change',
-    'mean_change': 'Mean Change',
-    'binned_entropy': 'Binned Entropy',
-    'approximate_entropy': 'Approximate Entropy',
-    'sample_entropy': 'Sample Entropy',
-    'count_above_mean': 'Spikes Above Baseline',
-    'count_below_mean': 'Drops Below Baseline',
-    'last_location_of_minimum': 'Timing of Lowest Drop',
-    'last_location_of_maximum': 'Timing of Highest Peak',
-    'longest_strike_below_mean': 'Longest Period Below Baseline',
-    'longest_strike_above_mean': 'Longest Period Above Baseline',
-    'number_crossing_m': 'Baseline Crossings',
-    'percentage_of_reoccurring_values_to_all_values': 'Reoccurring Value Ratio',
-    'ratio_value_number_to_time_series_length': 'Data Point Density',
-    'index_mass_quantile': 'Early vs Late Burden Shift'
-}
-
-def translate_feature_name(raw_name):
-    clean_name = raw_name
-    for key, val in CLINICAL_MAP.items():
-        if key in clean_name:
-            clean_name = clean_name.replace(key, val)
-    clean_name = clean_name.replace('__', ' ').replace('_', ' ').replace('attr "real" ', '').replace('attr "imag" ', '').replace('attr "angle" ', '')
-    # Remove extraneous coefficient numbers if present to keep it strictly clinical
-    import re
-    clean_name = re.sub(r'coeff \d+', '', clean_name)
-    clean_name = re.sub(r'q \d+\.\d+', '', clean_name)
-    return clean_name.strip()
-
-# -----------------------------------------------------------------------------
-# 1. Initialization & Setup
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="t-MELD: Temporal Liver Risk Stratification",
-    page_icon="🩺",
-    layout="wide",
-    initial_sidebar_state="expanded"
+# Local vision module
+from HepSense_Vision import (
+    HepSenseDANN, load_trained_model, predict_ultrasound,
+    CLASS_NAMES, DEVICE, MODEL_SAVE_PATH, NUM_CLASSES, NUM_DOMAINS,
 )
 
-# Custom CSS for UI polish and a frictionless clinical experience
-st.markdown("""
-<style>
-    .metric-container {
-        padding: 30px;
-        border-radius: 12px;
-        text-align: center;
-        box-shadow: 0px 4px 15px rgba(0, 0, 0, 0.1);
-        margin-bottom: 20px;
-    }
-    .metric-title { font-size: 20px; font-weight: 600; color: #555; letter-spacing: 1px;}
-    .metric-value { font-size: 72px; font-weight: 800; margin: 10px 0; }
-    .risk-low { background-color: #f0fdf4; border-left: 8px solid #22c55e; color: #166534; }
-    .risk-medium { background-color: #fefce8; border-left: 8px solid #eab308; color: #854d0e; }
-    .risk-high { background-color: #fef2f2; border-left: 8px solid #ef4444; color: #991b1b; }
-    .summary-box {
-        background-color: #f8fafc;
-        border: 1px solid #e2e8f0;
-        padding: 20px;
-        border-radius: 8px;
-        font-size: 18px;
-        color: #334155;
-        line-height: 1.6;
-    }
-</style>
-""", unsafe_allow_html=True)
+warnings.filterwarnings("ignore")
 
-st.title("t-MELD: Temporal Liver Risk Stratification")
-st.markdown("Clinical Decision Support System (CDSS) for predicting 14-day hepatic decompensation using calibrated sequence modeling.")
+# =============================================================================
+# 1. MODEL LOADING
+# =============================================================================
 
-@st.cache_resource
-def load_models():
-    """Load calibrated models and rigorously pruned feature set."""
-    try:
-        model = joblib.load('tmeld_production.pkl')
-        selected_cols = joblib.load('selected_features.pkl')
-        
-        try:
-            le = joblib.load('le_production.pkl')
-        except FileNotFoundError:
-            le = None
-            
-        static_feats = ['age', 'gender']
-        ts_cols = [c for c in selected_cols if c not in static_feats]
-        
-        kind_to_fc_parameters = from_columns(ts_cols)
-        
-        return model, selected_cols, le, kind_to_fc_parameters
-    except FileNotFoundError:
-        return None, None, None, None
+def load_all_models():
+    """
+    Load all three expert models. Returns a dict of loaded models.
+    Gracefully handles missing model files.
+    """
+    models = {}
 
-model, selected_cols, le, kind_to_fc_parameters = load_models()
-
-if model is None:
-    st.error("⚠️ **System Offline:** Production artifacts (`tmeld_production.pkl` or `selected_features.pkl`) not found. Please run `train.py`.")
-    st.stop()
-
-# Extract underlying XGBoost model for SHAP from CalibratedClassifierCV
-if hasattr(model, 'calibrated_classifiers_'):
-    base_xgb_model = model.calibrated_classifiers_[0].estimator
-else:
-    base_xgb_model = model
-
-# -----------------------------------------------------------------------------
-# Patient Demographics (Sidebar)
-# -----------------------------------------------------------------------------
-with st.sidebar:
-    st.header("Patient Demographics")
-    st.markdown("Enter static clinical data.")
-    age_val = st.number_input("Patient Age", min_value=18, max_value=120, value=55)
-    
-    if le is not None:
-        gender_val = st.selectbox("Gender", le.classes_)
+    # --- Vision Expert (PyTorch DANN) ---
+    if os.path.exists(MODEL_SAVE_PATH):
+        models["vision"] = load_trained_model(MODEL_SAVE_PATH)
+        print(f"[OK] Vision Expert loaded from {MODEL_SAVE_PATH}")
     else:
-        gender_val = st.selectbox("Gender", ["M", "F"])
+        models["vision"] = None
+        print(f"[✗] Vision model not found at {MODEL_SAVE_PATH}. Run HepSense_Vision.py first.")
 
-# -----------------------------------------------------------------------------
-# 2. The "Zero-Friction" Data Input Zone
-# -----------------------------------------------------------------------------
-st.header("Longitudinal EHR Import")
-st.markdown("Input the patient's irregular clinical timeline. Missing days will be automatically imputed via forward-filling.")
+    # --- Clinical Expert (XGBoost) ---
+    clin_path = "hepsense_clinical_xgboost_v1.joblib"
+    if os.path.exists(clin_path):
+        models["clinical"] = joblib.load(clin_path)
+        print(f"[OK] Clinical Expert loaded from {clin_path}")
+    else:
+        models["clinical"] = None
+        print(f"[✗] Clinical model not found at {clin_path}")
 
-target_tests = [
-    "Bilirubin, Total", "INR(PT)", "Creatinine", 
-    "Platelet Count", "Alanine Aminotransferase (ALT)", 
-    "Asparate Aminotransferase (AST)"
-]
+    # --- Temporal Expert (XGBoost) ---
+    temp_path = "hepsense_temporal_xgboost_v1.joblib"
+    if os.path.exists(temp_path):
+        models["temporal"] = joblib.load(temp_path)
+        print(f"[OK] Temporal Expert loaded from {temp_path}")
+    else:
+        models["temporal"] = None
+        print(f"[✗] Temporal model not found at {temp_path}")
 
-tab1, tab2 = st.tabs(["📁 EHR File Upload", "📋 Quick Paste"])
+    return models
 
-df_input = None
 
-with tab1:
-    uploaded_file = st.file_uploader(
-        "Upload EHR CSV Extract", 
-        type=["csv"],
-        help="CSV must contain a `charttime` column and test name columns."
-    )
-    if uploaded_file is not None:
-        try:
-            df_input = pd.read_csv(uploaded_file)
-            st.success("EHR File successfully parsed!")
-        except Exception as e:
-            st.error(f"Error parsing CSV: {e}")
+# =============================================================================
+# 2. INDIVIDUAL EXPERT INFERENCE FUNCTIONS
+# =============================================================================
 
-with tab2:
-    pasted_data = st.text_area(
-        "Paste EHR Data (Tab-Separated or CSV)",
-        height=150,
-        help="Paste directly from your EHR system grid.",
-        placeholder='charttime,"Bilirubin, Total",INR(PT),Creatinine\n2023-10-01,1.2,1.1,0.9\n2023-10-05,2.1,1.4,1.2'
-    )
-    if pasted_data and uploaded_file is None:
-        try:
-            sep = ',' if ',' in pasted_data.split('\n')[0] else '\t'
-            df_input = pd.read_csv(io.StringIO(pasted_data), sep=sep)
-            st.success("Pasted data successfully parsed!")
-        except Exception as e:
-            st.error("Error reading pasted data. Ensure it includes headers and is formatted correctly.")
+def run_vision_expert(image_path: str, vision_model) -> dict:
+    """
+    Run the DANN vision model on an ultrasound image.
+    Returns fibrosis stage prediction + Grad-CAM overlay.
+    """
+    if vision_model is None:
+        return {"stage": "UNAVAILABLE", "confidence": 0.0,
+                "probabilities": {}, "gradcam_overlay": None,
+                "error": "Vision model not loaded."}
 
-if df_input is not None and not df_input.empty:
-    st.dataframe(df_input.head(3), use_container_width=True)
+    result = predict_ultrasound(image_path, vision_model)
+    return {
+        "stage":           result["predicted_stage"],
+        "confidence":      result["confidence"],
+        "probabilities":   result["probabilities"],
+        "gradcam_overlay": result["gradcam_overlay"],
+        "error":           None,
+    }
 
-# -----------------------------------------------------------------------------
-# 3 & 4. Automated Preprocessing & Optimized Inference Engine
-# -----------------------------------------------------------------------------
-if st.button("Run Calibrated Risk Engine", type="primary", use_container_width=True):
-    if df_input is None or df_input.empty:
-        st.warning("Please upload a file or paste EHR data before running the engine.")
-        st.stop()
-        
-    with st.spinner("Executing Clinical Preprocessing and Time-Series Inference..."):
-        try:
-            cols_lower = {c.lower(): c for c in df_input.columns}
-            if 'charttime' not in cols_lower:
-                st.error("CRITICAL ERROR: Input data must contain a `charttime` column.")
-                st.stop()
-            else:
-                df_input = df_input.rename(columns={cols_lower['charttime']: 'charttime'})
-            
-            df_input['charttime'] = pd.to_datetime(df_input['charttime'], errors='coerce')
-            df_input = df_input.dropna(subset=['charttime'])
-            
-            available_tests = [c for c in target_tests if c in df_input.columns]
-            if not available_tests:
-                st.error(f"CRITICAL ERROR: None of the target clinical tests found. Expected at least one of: {target_tests}")
-                st.stop()
-                
-            df_input = df_input.sort_values('charttime')
-            
-            # Resample to 14-day uniform grid (Daily) and Forward Fill
-            df_input.set_index('charttime', inplace=True)
-            df_daily = df_input[available_tests].resample('D').mean()
-            df_daily = df_daily.ffill()
-            
-            df_clean = df_daily.reset_index()
-            df_clean['subject_id'] = 1 
 
-            df_long = pd.melt(
-                df_clean, 
-                id_vars=['subject_id', 'charttime'], 
-                value_vars=available_tests,
-                var_name='lab_test_name',
-                value_name='valuenum'
-            ).dropna()
-            
-            # Optimized Inference Extraction (milliseconds)
-            X_extracted = extract_features(
-                df_long,
-                column_id='subject_id',
-                column_sort='charttime',
-                column_kind='lab_test_name',
-                column_value='valuenum',
-                kind_to_fc_parameters=kind_to_fc_parameters,
-                impute_function=impute,
-                disable_progressbar=True
-            )
-            
-            if le is not None:
-                try:
-                    gender_encoded = le.transform([gender_val])[0]
-                except Exception:
-                    gender_encoded = 1 if gender_val == "M" else 0
-            else:
-                gender_encoded = 1 if gender_val == "M" else 0
-                
-            X_extracted['gender'] = gender_encoded
-            X_extracted['age'] = age_val
-            
-            for col in selected_cols:
-                if col not in X_extracted.columns:
-                    X_extracted[col] = 0.0
-            
-            X_final = X_extracted[selected_cols]
-            
-            # -----------------------------------------------------------------------------
-            # 5. Prediction & Clinical Explainability (Outputs)
-            # -----------------------------------------------------------------------------
-            
-            # Calibrated probability
-            prob = model.predict_proba(X_final)[0][1]
-            
-            st.divider()
-            
-            if prob < 0.20:
-                risk_class = "risk-low"
-                risk_text = "LOW RISK"
-            elif prob < 0.50:
-                risk_class = "risk-medium"
-                risk_text = "MODERATE RISK"
-            else:
-                risk_class = "risk-high"
-                risk_text = "HIGH RISK"
-                
-            st.markdown(f"""
-                <div class="metric-container {risk_class}">
-                    <div class="metric-title">CALIBRATED {risk_text}</div>
-                    <div class="metric-value">{prob*100:.1f}%</div>
-                    <div style="font-size: 16px;">Predicted Probability of 14-Day Hepatic Decompensation</div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # SHAP XAI Engine using base XGBoost
-            explainer = shap.TreeExplainer(base_xgb_model)
-            shap_values = explainer(X_final)
-            
-            # Rename features for Clinical UI
-            translated_names = [translate_feature_name(f) for f in shap_values.feature_names]
-            shap_values.feature_names = translated_names
-            
-            # Clinical Translation Logic
-            shap_vals = shap_values.values[0]
-            feature_impact = {translated_names[i]: (shap_vals[i], abs(shap_vals[i])) for i in range(len(translated_names))}
-            sorted_impact = sorted(feature_impact.items(), key=lambda x: x[1][1], reverse=True)
-            
-            top_features = []
-            for feat, (val, abs_val) in sorted_impact[:3]:
-                direction = "increasing" if val > 0 else "decreasing"
-                top_features.append(f"the {direction} impact of **{feat}**")
-                
-            if len(top_features) > 1:
-                summary_text = f"This {risk_text.lower()} profile is driven primarily by {', '.join(top_features[:-1])}, and {top_features[-1]}."
-            elif len(top_features) == 1:
-                summary_text = f"This {risk_text.lower()} profile is driven primarily by {top_features[0]}."
-            else:
-                summary_text = "Clinical trajectory indicates stable status."
+def run_clinical_expert(blood_data: dict, clinical_model) -> dict:
+    """
+    Run the clinical XGBoost model on structured blood panel data.
 
-            st.markdown("### AI Clinical Translation")
-            st.markdown(f"""
-                <div class="summary-box">
-                    <strong>🩺 Auto-Summary:</strong> {summary_text}
-                </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown("<br><hr><br>", unsafe_allow_html=True)
-            st.subheader("Deep Explainability (SHAP Waterfall Plot)")
-            st.markdown("Visual breakdown of the calibrated top 30 longitudinal vectors shifting the risk probability.")
-            
-            fig = plt.figure(figsize=(10, 6))
-            shap.plots.waterfall(shap_values[0], max_display=10, show=False)
+    Args:
+        blood_data: dict matching the feature columns expected by the model.
+                    E.g. from Ds/labs_features.csv format.
+        clinical_model: trained XGBoost or CalibratedClassifierCV
+
+    Returns:
+        dict with risk_probability, risk_label, contributing_features
+    """
+    if clinical_model is None:
+        return {"risk_probability": 0.0, "risk_label": "UNAVAILABLE",
+                "error": "Clinical model not loaded."}
+
+    df = pd.DataFrame([blood_data])
+
+    # Get expected features and align
+    if hasattr(clinical_model, "feature_names_in_"):
+        expected = list(clinical_model.feature_names_in_)
+    elif hasattr(clinical_model, "get_booster"):
+        expected = clinical_model.get_booster().feature_names
+    else:
+        expected = list(df.columns)
+
+    for col in expected:
+        if col not in df.columns:
+            df[col] = 0.0
+    df = df[expected]
+
+    prob = clinical_model.predict_proba(df)[0]
+    risk_idx = int(np.argmax(prob))
+    risk_prob = float(prob[risk_idx]) if prob.ndim == 1 else float(prob[1]) if prob.shape[1] == 2 else float(prob[risk_idx])
+
+    # For binary: use positive class probability
+    if len(prob) == 2:
+        risk_prob = float(prob[1])
+        risk_label = "HIGH" if risk_prob >= 0.5 else ("MODERATE" if risk_prob >= 0.2 else "LOW")
+    else:
+        risk_label = f"CLASS_{risk_idx}"
+
+    return {"risk_probability": risk_prob, "risk_label": risk_label, "error": None}
+
+
+def run_temporal_expert(blood_data: dict, temporal_model) -> dict:
+    """
+    Run the temporal XGBoost model for trajectory-based risk forecast.
+    Uses velocity/trend features from longitudinal blood labs.
+    """
+    if temporal_model is None:
+        return {"trend_risk": 0.0, "trend_label": "UNAVAILABLE",
+                "failing_point": "Unknown", "error": "Temporal model not loaded."}
+
+    df = pd.DataFrame([blood_data])
+
+    if hasattr(temporal_model, "feature_names_in_"):
+        expected = list(temporal_model.feature_names_in_)
+    elif hasattr(temporal_model, "get_booster"):
+        expected = temporal_model.get_booster().feature_names
+    else:
+        expected = list(df.columns)
+
+    for col in expected:
+        if col not in df.columns:
+            df[col] = 0.0
+    df = df[expected]
+
+    prob = temporal_model.predict_proba(df)[0]
+    if len(prob) == 2:
+        trend_risk = float(prob[1])
+    else:
+        trend_risk = float(np.max(prob))
+
+    # Identify the top failing biomarker from feature importances
+    failing_point = "General Decline"
+    if hasattr(temporal_model, "feature_importances_"):
+        importances = temporal_model.feature_importances_
+        top_idx = int(np.argmax(importances))
+        if top_idx < len(expected):
+            failing_point = expected[top_idx]
+
+    trend_label = "DECLINING" if trend_risk >= 0.5 else ("WATCHFUL" if trend_risk >= 0.2 else "STABLE")
+
+    return {"trend_risk": trend_risk, "trend_label": trend_label,
+            "failing_point": failing_point, "error": None}
+
+
+# =============================================================================
+# 3. RULE-BASED INTEGRATION ENGINE
+# =============================================================================
+
+def integration_engine(vision_result: dict, clinical_result: dict,
+                       temporal_result: dict) -> dict:
+    """
+    Rule-Based Integration Engine -- the "Chief Medical Officer" logic.
+
+    Takes independent expert outputs and produces a unified HepSense
+    Combined Recommendation. This is DECISION-LEVEL fusion, not feature-level.
+
+    Returns:
+        dict with severity_level, recommendation, actions, color_code
+    """
+    stage = vision_result.get("stage", "UNAVAILABLE")
+    stage_conf = vision_result.get("confidence", 0.0)
+    risk_label = clinical_result.get("risk_label", "UNAVAILABLE")
+    risk_prob = clinical_result.get("risk_probability", 0.0)
+    trend_label = temporal_result.get("trend_label", "UNAVAILABLE")
+    trend_risk = temporal_result.get("trend_risk", 0.0)
+    failing_point = temporal_result.get("failing_point", "Unknown")
+
+    # --- CRITICAL: F3/F4 with high clinical risk ---
+    if stage in ("F4",) and risk_label == "HIGH":
+        return {
+            "severity_level": "CRITICAL",
+            "recommendation": (
+                f"CRITICAL: F4 Cirrhosis detected ({stage_conf:.0%} confidence) "
+                f"with HIGH decompensation risk ({risk_prob:.0%}). "
+                f"Primary failing biomarker: {failing_point}. "
+                "Fast-track transplant evaluation. Initiate portal hypertension "
+                "screening (EGD for varices). Hepatology consult STAT."
+            ),
+            "actions": [
+                "Immediate hepatology referral",
+                "Schedule EGD for variceal screening",
+                "Initiate transplant evaluation workup",
+                "ICU standby for acute decompensation",
+                "Start prophylactic beta-blocker therapy",
+            ],
+            "color_code": "red",
+        }
+
+    if stage in ("F3", "F4") and trend_label == "DECLINING":
+        return {
+            "severity_level": "CRITICAL",
+            "recommendation": (
+                f"CRITICAL: Advanced fibrosis ({stage}, {stage_conf:.0%}) with "
+                f"DECLINING trajectory (trend risk {trend_risk:.0%}). "
+                f"Key deterioration driver: {failing_point}. "
+                "Urgent inpatient admission recommended. High risk of "
+                "hepatic encephalopathy or variceal hemorrhage."
+            ),
+            "actions": [
+                "Urgent inpatient admission",
+                "Serial blood panel monitoring (q6h)",
+                "Lactulose/rifaximin for encephalopathy prevention",
+                "Hepatology and transplant team consultation",
+            ],
+            "color_code": "red",
+        }
+
+    if stage == "F3" and risk_label in ("HIGH", "MODERATE"):
+        return {
+            "severity_level": "HIGH",
+            "recommendation": (
+                f"HIGH RISK: F3 fibrosis ({stage_conf:.0%}) with {risk_label} "
+                f"decompensation risk ({risk_prob:.0%}). "
+                f"Monitor {failing_point} closely. "
+                "Aggressive antifibrotic therapy and close follow-up required."
+            ),
+            "actions": [
+                "Hepatology referral within 1 week",
+                "FibroScan / elastography for confirmation",
+                "Repeat blood panel in 7 days",
+                "Evaluate for antifibrotic therapy",
+            ],
+            "color_code": "orange",
+        }
+
+    # --- MODERATE: Early-to-mid fibrosis with warning signs ---
+    if stage in ("F1", "F2") and (risk_label == "HIGH" or trend_label == "DECLINING"):
+        return {
+            "severity_level": "MODERATE",
+            "recommendation": (
+                f"MODERATE RISK: Early fibrosis ({stage}, {stage_conf:.0%}) but "
+                f"clinical trajectory is concerning -- {risk_label} risk "
+                f"({risk_prob:.0%}), trajectory: {trend_label}. "
+                f"Biomarker of concern: {failing_point}. "
+                "Lifestyle intervention + close surveillance needed."
+            ),
+            "actions": [
+                "Schedule hepatology follow-up in 2 weeks",
+                "Lifestyle modification counseling (alcohol cessation, diet)",
+                "Repeat labs in 14 days to confirm trajectory",
+                "Consider liver biopsy for staging confirmation",
+            ],
+            "color_code": "yellow",
+        }
+
+    if stage in ("F1", "F2") and risk_label == "MODERATE":
+        return {
+            "severity_level": "LOW-MODERATE",
+            "recommendation": (
+                f"LOW-MODERATE: {stage} fibrosis ({stage_conf:.0%}), "
+                f"moderate clinical risk ({risk_prob:.0%}). "
+                "Continue current management with periodic monitoring."
+            ),
+            "actions": [
+                "Routine follow-up in 3-6 months",
+                "Annual FibroScan monitoring",
+                "Lifestyle modification counseling",
+            ],
+            "color_code": "yellow",
+        }
+
+    # --- LOW: F0 or minimal risk ---
+    if stage == "F0":
+        return {
+            "severity_level": "LOW",
+            "recommendation": (
+                f"LOW RISK: No significant fibrosis detected ({stage}, "
+                f"{stage_conf:.0%}). Clinical risk: {risk_label} ({risk_prob:.0%}). "
+                "Routine surveillance recommended."
+            ),
+            "actions": [
+                "Annual liver function panel",
+                "Lifestyle counseling (hepatoprotective diet)",
+                "Re-image in 12-24 months if risk factors persist",
+            ],
+            "color_code": "green",
+        }
+
+    # --- DEFAULT FALLBACK ---
+    return {
+        "severity_level": "INDETERMINATE",
+        "recommendation": (
+            f"Stage: {stage} ({stage_conf:.0%}), "
+            f"Clinical risk: {risk_label} ({risk_prob:.0%}), "
+            f"Trajectory: {trend_label} ({trend_risk:.0%}). "
+            "Insufficient data for a definitive recommendation. "
+            "Recommend hepatology consultation for comprehensive evaluation."
+        ),
+        "actions": ["Hepatology consultation", "Complete blood panel", "Imaging follow-up"],
+        "color_code": "gray",
+    }
+
+
+# =============================================================================
+# 4. MAIN DASHBOARD FUNCTION (Streamlit-Ready)
+# =============================================================================
+
+def hep_sense_clinical_dashboard(patient_image: str,
+                                  patient_blood_data: dict,
+                                  models: dict = None) -> dict:
+    """
+    The primary entry point for the HepSense Modular CDSS.
+
+    Args:
+        patient_image:      Path to the patient's ultrasound image.
+        patient_blood_data: Dict of blood panel values matching model features.
+        models:             Pre-loaded model dict (from load_all_models()).
+
+    Returns:
+        Comprehensive dict with:
+            - vision_result:   Stage prediction + Grad-CAM
+            - clinical_result: Decompensation risk
+            - temporal_result: Trajectory risk + failing point
+            - recommendation:  Unified HepSense Combined Recommendation
+    """
+    if models is None:
+        models = load_all_models()
+
+    print("\n" + "=" * 60)
+    print("  HepSense Modular CDSS -- Running All Expert Modules")
+    print("=" * 60)
+
+    # --- Expert 1: Vision ---
+    print("\n[1/3] Vision Expert (DANN EfficientNet-B0)...")
+    vision_result = run_vision_expert(patient_image, models.get("vision"))
+    print(f"      -> Stage: {vision_result['stage']} "
+          f"({vision_result['confidence']:.1%})")
+
+    # --- Expert 2: Clinical ---
+    print("[2/3] Clinical Expert (XGBoost)...")
+    clinical_result = run_clinical_expert(patient_blood_data, models.get("clinical"))
+    print(f"      -> Risk: {clinical_result['risk_label']} "
+          f"({clinical_result['risk_probability']:.1%})")
+
+    # --- Expert 3: Temporal ---
+    print("[3/3] Temporal Expert (XGBoost)...")
+    temporal_result = run_temporal_expert(patient_blood_data, models.get("temporal"))
+    print(f"      -> Trend: {temporal_result['trend_label']} "
+          f"({temporal_result['trend_risk']:.1%})")
+
+    # --- Integration Engine ---
+    print("\n[CMO] Rule-Based Integration Engine...")
+    recommendation = integration_engine(vision_result, clinical_result, temporal_result)
+    print(f"      -> Severity: {recommendation['severity_level']}")
+    print(f"      -> {recommendation['recommendation']}")
+
+    return {
+        "vision_result":   vision_result,
+        "clinical_result": clinical_result,
+        "temporal_result": temporal_result,
+        "recommendation":  recommendation,
+    }
+
+
+# =============================================================================
+# 5. CLI DEMO
+# =============================================================================
+
+if __name__ == "__main__":
+    print("HepSense Modular CDSS -- CLI Demo")
+    print("-" * 40)
+
+    all_models = load_all_models()
+
+    # Demo blood data matching clinical_pipeline.py features
+    demo_blood = {
+        "Bili_last": 3.2, "Bili_max": 4.8, "Bili_velocity": 1.6,
+        "Creat_last": 1.8, "Creat_max": 2.1, "Creat_velocity": 0.5,
+        "INR_last": 1.9, "INR_max": 2.3, "INR_velocity": 0.4,
+        "Sodium_last": 131.0, "Sodium_min": 128.0,
+        "Platelets_last": 78.0,
+        "NLP_Encephalopathy_Flag": 1,
+        "NLP_Variceal_Bleeding_Flag": 0,
+    }
+
+    # Use first F4 image as demo if available
+    demo_img = None
+    f4_dir = os.path.join("Dataset", "F4")
+    if os.path.isdir(f4_dir):
+        imgs = [f for f in os.listdir(f4_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+        if imgs:
+            demo_img = os.path.join(f4_dir, imgs[0])
+
+    if demo_img:
+        result = hep_sense_clinical_dashboard(demo_img, demo_blood, all_models)
+
+        print("\n" + "=" * 60)
+        print("  FINAL HEPSENSE COMBINED RECOMMENDATION")
+        print("=" * 60)
+        rec = result["recommendation"]
+        print(f"  Severity : {rec['severity_level']}")
+        print(f"  Summary  : {rec['recommendation']}")
+        print(f"  Actions  :")
+        for a in rec["actions"]:
+            print(f"    • {a}")
+
+        # Save Grad-CAM if available
+        cam = result["vision_result"].get("gradcam_overlay")
+        if cam is not None:
+            plt.figure(figsize=(6, 6))
+            plt.imshow(cam)
+            plt.title(f"Grad-CAM -- {result['vision_result']['stage']}")
+            plt.axis("off")
             plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-            
-        except Exception as e:
-            st.error(f"❌ **Processing Error:** {e}")
-            import traceback
-            st.expander("Show Traceback").text(traceback.format_exc())
+            plt.savefig("hepsense_gradcam_output.png", dpi=150)
+            plt.close()
+            print("\n  Grad-CAM saved -> hepsense_gradcam_output.png")
+    else:
+        print("[WARN] No demo image found in Dataset/F4. Skipping vision demo.")
+        print("       Provide an image path to hep_sense_clinical_dashboard().")
