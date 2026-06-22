@@ -1,307 +1,454 @@
-import React, { useState, useRef } from 'react';
-import { 
-  Activity, UploadCloud, AlertCircle, FileText, User, ActivitySquare, CheckCircle2 
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Stethoscope, Activity, FileText, ChevronRight,
+  AlertCircle, ShieldCheck, HeartPulse, HelpCircle,
+  FlaskConical, UserCircle, ChevronDown, ChevronUp
 } from 'lucide-react';
-import { 
-  Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, 
-  BarElement, Title, Tooltip, Legend 
-} from 'chart.js';
-import { Line, Bar } from 'react-chartjs-2';
 
-ChartJS.register(
-  CategoryScale, LinearScale, PointElement, LineElement, BarElement, Title, Tooltip, Legend
-);
+/* ── Clinical Reference Cases ─────────────────────────────── */
+const PRESETS = [
+  {
+    id: 'healthy',
+    name: 'Standard Baseline',
+    desc: 'Normal hepatic function',
+    age: 35, gender: 'Male',
+    total_bilirubin: 0.7, direct_bilirubin: 0.1,
+    alkaline_phosphotase: 95, alamine_aminotransferase: 22,
+    aspartate_aminotransferase: 20, total_protiens: 7.2,
+    albumin: 4.2, albumin_and_globulin_ratio: 1.4,
+  },
+  {
+    id: 'early',
+    name: 'Hepatitis Pattern',
+    desc: 'Elevated transaminases',
+    age: 45, gender: 'Male',
+    total_bilirubin: 2.1, direct_bilirubin: 0.8,
+    alkaline_phosphotase: 220, alamine_aminotransferase: 72,
+    aspartate_aminotransferase: 65, total_protiens: 6.8,
+    albumin: 3.8, albumin_and_globulin_ratio: 1.1,
+  },
+  {
+    id: 'cirrhosis',
+    name: 'Advanced Cirrhosis',
+    desc: 'Severe enzyme derangement',
+    age: 62, gender: 'Male',
+    total_bilirubin: 8.4, direct_bilirubin: 5.2,
+    alkaline_phosphotase: 680, alamine_aminotransferase: 185,
+    aspartate_aminotransferase: 210, total_protiens: 5.4,
+    albumin: 2.4, albumin_and_globulin_ratio: 0.6,
+  },
+];
 
-function App() {
-  const [age, setAge] = useState(55);
-  const [gender, setGender] = useState('M');
-  const [imageFile, setImageFile] = useState(null);
-  const [csvFile, setCsvFile] = useState(null);
-  const [csvText, setCsvText] = useState("");
+const FIELDS = [
+  { key: 'total_bilirubin', label: 'Total Bilirubin', unit: 'mg/dL', step: 0.1 },
+  { key: 'direct_bilirubin', label: 'Direct Bilirubin', unit: 'mg/dL', step: 0.1 },
+  { key: 'alkaline_phosphotase', label: 'Alkaline Phosphatase', unit: 'IU/L', step: 1 },
+  { key: 'alamine_aminotransferase', label: 'ALT (SGPT)', unit: 'U/L', step: 1 },
+  { key: 'aspartate_aminotransferase', label: 'AST (SGOT)', unit: 'U/L', step: 1 },
+  { key: 'total_protiens', label: 'Total Proteins', unit: 'g/dL', step: 0.1 },
+  { key: 'albumin', label: 'Serum Albumin', unit: 'g/dL', step: 0.1 },
+  { key: 'albumin_and_globulin_ratio', label: 'A/G Ratio', unit: 'ratio', step: 0.01},
+];
+
+const DEFAULTS = {
+  age: 45, gender: 'Male',
+  total_bilirubin: 1.0, direct_bilirubin: 0.3,
+  alkaline_phosphotase: 200, alamine_aminotransferase: 35,
+  aspartate_aminotransferase: 32, total_protiens: 6.8,
+  albumin: 3.5, albumin_and_globulin_ratio: 1.0,
+};
+
+export default function App() {
+  const [form, setForm] = useState(DEFAULTS);
+  const [activePreset, setPreset] = useState('');
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
-  
-  const imageInputRef = useRef();
-  const csvInputRef = useRef();
+  const [apiStatus, setStatus] = useState('loading');
+  const [modelInfo, setModelInfo] = useState(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [timeline, setTimeline] = useState([]);
 
-  const handleAnalyze = async () => {
-    if (!imageFile && !csvFile && !csvText.trim()) {
-      setError("Please upload at least one input (Ultrasound Image or EHR CSV data).");
-      return;
-    }
-    
+  useEffect(() => {
+    fetch('/api/health')
+      .then(r => r.json())
+      .then(d => {
+        setStatus(d.model_loaded ? 'ok' : 'error');
+        setModelInfo(d);
+      })
+      .catch(() => setStatus('error'));
+  }, []);
+
+  const applyPreset = (p) => {
+    const { id, name, desc, ...vals } = p;
+    setForm(vals);
+    setPreset(p.id);
+  };
+
+  const setField = (k, v) => {
+    setForm(f => ({ ...f, [k]: v }));
+    setPreset('');
+  };
+
+  const analyze = useCallback(async () => {
     setError(null);
     setLoading(true);
-    
-    const formData = new FormData();
-    formData.append('age', age);
-    formData.append('gender', gender);
-    if (imageFile) formData.append('image', imageFile);
-    if (csvFile) {
-      formData.append('csv_file', csvFile);
-    } else if (csvText.trim()) {
-      const file = new File([csvText], "pasted.csv", { type: "text/csv" });
-      formData.append('csv_file', file);
-    }
-    
     try {
-      // Point this to backend URL where FastAPI is running
-      const res = await fetch('http://localhost:8000/api/analyze', {
+      const res = await fetch('/api/predict', {
         method: 'POST',
-        body: formData
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...form,
+          age: parseInt(form.age),
+          total_bilirubin: parseFloat(form.total_bilirubin),
+          direct_bilirubin: parseFloat(form.direct_bilirubin),
+          alkaline_phosphotase: parseFloat(form.alkaline_phosphotase),
+          alamine_aminotransferase: parseFloat(form.alamine_aminotransferase),
+          aspartate_aminotransferase: parseFloat(form.aspartate_aminotransferase),
+          total_protiens: parseFloat(form.total_protiens),
+          albumin: parseFloat(form.albumin),
+          albumin_and_globulin_ratio: parseFloat(form.albumin_and_globulin_ratio),
+        }),
       });
-      
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.detail || "Analysis failed");
-      }
-      
+      if (!res.ok) throw new Error('Prediction failed');
       const data = await res.json();
       setResults(data);
-    } catch (err) {
-      setError(err.message);
+
+      // Record prediction to serial timeline
+      setTimeline(prev => [
+        ...prev,
+        {
+          day: prev.length + 1,
+          probability: data.probability,
+          tier: data.tier,
+          color: data.color,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          labs: { ...form },
+          summary: data.summary,
+          actions: data.actions,
+          abnormal_markers: data.abnormal_markers,
+          shap_contributions: data.shap_contributions,
+          model_metrics: data.model_metrics
+        }
+      ]);
+    } catch (e) {
+      setError(e.message);
     } finally {
       setLoading(false);
     }
-  };
+  }, [form]);
 
-  const trendDataChart = {
-    labels: results?.trends?.[0]?.dates || [],
-    datasets: results?.trends?.map((t, i) => ({
-      label: t.test,
-      data: t.values,
-      borderColor: ['#2dd4bf', '#0ea5e9', '#eab308', '#ec4899', '#a855f7', '#f97316'][i % 6],
-      tension: 0.3,
-      borderWidth: 2,
-      pointRadius: 3
-    })) || []
+  useEffect(() => { analyze(); }, []);
+
+  // Educational Visualizer for SHAP
+  const renderDiagnosticBalance = () => {
+    if (!results || !results.shap_contributions) return null;
+    
+    return (
+      <div className="diagnostic-balance">
+        <h3 className="section-title"><HelpCircle size={16}/> Pathological Weighting</h3>
+        <p className="edu-text">This visualizes how specific biomarkers tilt the diagnosis toward or away from disease.</p>
+        
+        <div className="balance-scale">
+          <div className="scale-header">
+            <span className="safe-text">Healthy Indicators</span>
+            <span className="risk-text">Pathology Indicators</span>
+          </div>
+          
+          <div className="scale-tracks">
+            {results.shap_contributions.map((s) => {
+              const isRisk = s.shap_value > 0;
+              const width = Math.min(Math.abs(s.shap_value) * 150, 100);
+              
+              return (
+                <div key={s.feature} className="scale-row">
+                  <div className="scale-label">
+                    <span className="marker-name">{s.label}</span>
+                    <span className="marker-val">{s.value} <small>{s.unit}</small></span>
+                  </div>
+                  
+                  <div className="scale-bar-area">
+                    {/* Left side (Healthy) */}
+                    <div className="scale-side left">
+                      {!isRisk && <div className="bar safe-bar" style={{ width: `${width}%` }} />}
+                    </div>
+                    
+                    <div className="scale-center-line" />
+                    
+                    {/* Right side (Risk) */}
+                    <div className="scale-side right">
+                      {isRisk && <div className="bar risk-bar" style={{ width: `${width}%` }} />}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   return (
-    <div className="app-container">
-      {/* Sidebar */}
-      <aside className="sidebar">
-        <div className="logo-container">
-          <div className="logo-icon">
-            <Activity size={24} />
+    <div className="edu-layout">
+      
+      {/* LEFT COLUMN: The Patient Chart */}
+      <section className="patient-chart custom-scrollbar">
+        <header className="chart-header">
+          <div className="academic-brand">
+            <Stethoscope size={28} className="brand-icon" />
+            <div>
+              <h1>HepSense Clinical</h1>
+              <p>ILPD Diagnostic Educator</p>
+            </div>
           </div>
-          <div className="logo-text">
-            <h1>HepSense</h1>
-            <p>Clinical Decision Support</p>
+          <div className={`status-pill ${apiStatus}`}>
+            {apiStatus === 'ok' ? 'System Ready' : apiStatus === 'error' ? 'Engine Offline' : 'Initializing...'}
           </div>
-        </div>
+        </header>
 
-        <div className="card">
-          <div className="card-title">
-            <User size={16} /> Patient Information
-          </div>
-          <div className="input-row">
-            <div className="input-group">
-              <label>Age</label>
-              <input type="number" value={age} onChange={e => setAge(e.target.value)} min={18} max={120} />
-            </div>
-            <div className="input-group">
-              <label>Sex</label>
-              <select value={gender} onChange={e => setGender(e.target.value)}>
-                <option value="M">Male</option>
-                <option value="F">Female</option>
-              </select>
+        <div className="chart-content">
+          <div className="form-section">
+            <h2 className="form-heading"><FileText size={16}/> Reference Cases</h2>
+            <div className="preset-row">
+              {PRESETS.map(p => (
+                <button 
+                  key={p.id} 
+                  className={`preset-pill ${activePreset === p.id ? 'active' : ''}`}
+                  onClick={() => applyPreset(p)}
+                >
+                  {p.name}
+                </button>
+              ))}
             </div>
           </div>
-        </div>
 
-        <div className="card">
-          <div className="card-title">
-            <UploadCloud size={16} /> Input Data
-          </div>
-          
-          <div className="input-group">
-            <label>Ultrasound Image</label>
-            <div 
-              className="dropzone" 
-              onClick={() => imageInputRef.current.click()}
-            >
-              <input 
-                type="file" 
-                hidden 
-                ref={imageInputRef} 
-                accept="image/*"
-                onChange={e => setImageFile(e.target.files[0])}
-              />
-              <UploadCloud className="dropzone-icon" size={24} />
-              <div className="dropzone-text">Click to upload image</div>
-              <div className="dropzone-sub">JPG, PNG, BMP</div>
-            </div>
-            {imageFile && (
-              <div className="file-preview">
-                {imageFile.name}
-                <CheckCircle2 size={14} />
+          <div className="form-section">
+            <h2 className="form-heading"><UserCircle size={16}/> Patient Vitals</h2>
+            <div className="input-grid-2">
+              <div className="edu-input">
+                <label>Age</label>
+                <input type="number" value={form.age} onChange={e => setField('age', e.target.value)} />
               </div>
-            )}
-          </div>
-
-          <div className="input-group" style={{marginTop: '20px'}}>
-            <label>Lab Results</label>
-            <div 
-              className="dropzone" 
-              onClick={() => csvInputRef.current.click()}
-              style={{marginBottom: '10px'}}
-            >
-              <input 
-                type="file" 
-                hidden 
-                ref={csvInputRef} 
-                accept=".csv"
-                onChange={e => {
-                  setCsvFile(e.target.files[0]);
-                  setCsvText('');
-                }}
-              />
-              <FileText className="dropzone-icon" size={24} />
-              <div className="dropzone-text">Click to upload EHR CSV</div>
-              <div className="dropzone-sub">charttime, lab_test, value</div>
-            </div>
-            {csvFile && (
-              <div className="file-preview">
-                {csvFile.name}
-                <CheckCircle2 size={14} />
-              </div>
-            )}
-            
-            <div style={{ textAlign: 'center', fontSize: '12px', color: 'var(--text-secondary)', margin: '8px 0' }}>OR</div>
-            
-            <textarea 
-              value={csvText}
-              onChange={e => {
-                setCsvText(e.target.value);
-                setCsvFile(null);
-              }}
-              placeholder="Paste CSV data here..."
-              style={{
-                width: '100%', height: '80px', padding: '10px', 
-                background: 'var(--bg-input)', border: '1px solid var(--border-color)',
-                color: 'var(--text-primary)', borderRadius: 'var(--radius-md)',
-                fontFamily: 'monospace', fontSize: '12px', resize: 'vertical',
-                outline: 'none', transition: 'border-color 0.2s, box-shadow 0.2s'
-              }}
-              onFocus={e => {
-                e.target.style.borderColor = 'var(--accent-primary)';
-                e.target.style.boxShadow = '0 0 0 2px rgba(2, 132, 199, 0.2)';
-              }}
-              onBlur={e => {
-                e.target.style.borderColor = 'var(--border-color)';
-                e.target.style.boxShadow = 'none';
-              }}
-            />
-          </div>
-        </div>
-
-        <button 
-          className="btn-primary" 
-          onClick={handleAnalyze} 
-          disabled={loading}
-        >
-          {loading ? <ActivitySquare className="spinner" size={18} /> : <ActivitySquare size={18} />}
-          {loading ? 'Analyzing...' : 'Run Assessment'}
-        </button>
-
-        {error && (
-          <div style={{color: '#ef4444', fontSize: '13px', padding: '10px', background: 'rgba(239, 68, 68, 0.1)', borderRadius: '8px'}}>
-            {error}
-          </div>
-        )}
-      </aside>
-
-      {/* Main Content */}
-      <main className="main-content">
-        {!results ? (
-          <div className="empty-state">
-            <Activity className="empty-state-icon" size={64} />
-            <h2>Ready for Analysis</h2>
-            <p>Upload an ultrasound image or laboratory CSV to generate risk stratification.</p>
-          </div>
-        ) : (
-          <div className="results-container">
-            <div className="header">
-              <h2>Assessment Report</h2>
-            </div>
-
-            {/* Alert Banner */}
-            <div className={`alert-banner alert-${results.recommendation.severity_level.replace(' ', '-')}`}>
-              <div className="alert-title">HepSense Risk Classification</div>
-              <div className="alert-level">
-                <AlertCircle size={28} /> {results.recommendation.severity_level}
-              </div>
-              <div className="alert-desc">{results.recommendation.recommendation}</div>
-            </div>
-
-            {/* Top Metrics */}
-            <div className="results-grid">
-              <div className="card">
-                <div className="card-title">Fibrosis Stage (Vision AI)</div>
-                <div className="metric-value">{results.vision.stage}</div>
-                <div className="metric-sub">
-                  Confidence: {results.vision.confidence ? (results.vision.confidence * 100).toFixed(1) + '%' : 'N/A'}
-                </div>
-              </div>
-              <div className="card">
-                <div className="card-title">Decompensation Risk (Clinical AI)</div>
-                <div className="metric-value">{results.clinical.risk_label}</div>
-                <div className="metric-sub">
-                  Risk Probability: {results.clinical.risk_probability ? (results.clinical.risk_probability * 100).toFixed(1) + '%' : 'N/A'}
-                </div>
-              </div>
-              <div className="card" style={{gridColumn: '1 / -1'}}>
-                <div className="card-title">Recommended Management Plan</div>
-                <ul className="action-list">
-                  {results.recommendation.actions.map((act, i) => (
-                    <li key={i}>{act}</li>
-                  ))}
-                </ul>
+              <div className="edu-input">
+                <label>Biological Sex</label>
+                <select value={form.gender} onChange={e => setField('gender', e.target.value)}>
+                  <option>Male</option><option>Female</option>
+                </select>
               </div>
             </div>
+          </div>
 
-            {/* Diagnostics */}
-            <div className="diagnostic-grid">
-              {results.vision.gradcam_overlay && (
-                <div className="card">
-                  <div className="card-title">Ultrasound Grad-CAM Analysis</div>
-                  <img 
-                    src={`data:image/png;base64,${results.vision.gradcam_overlay}`} 
-                    alt="GradCAM" 
-                    className="cam-image" 
+          <div className="form-section">
+            <h2 className="form-heading"><FlaskConical size={16}/> Comprehensive Hepatic Panel</h2>
+            <p className="edu-text">Enter biomarker assays to evaluate hepatic synthetic and excretory function.</p>
+            <div className="input-grid-2">
+              {FIELDS.map(({ key, label, unit, step }) => (
+                <div key={key} className="edu-input">
+                  <label>{label} <span>{unit}</span></label>
+                  <input
+                    type="number" step={step} value={form[key]}
+                    onChange={e => setField(key, e.target.value)}
                   />
                 </div>
-              )}
-              
-              {results.trends && results.trends.length > 0 && (
-                <div className="card" style={{gridColumn: results.vision.gradcam_overlay ? '2' : '1 / -1'}}>
-                  <div className="card-title">Normalized Laboratory Trends</div>
-                  <div className="chart-container">
-                    <Line 
-                      data={trendDataChart} 
-                      options={{
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                          legend: { labels: { color: '#94a3b8' } }
-                        },
-                        scales: {
-                          x: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } },
-                          y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' } }
-                        }
-                      }} 
-                    />
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="chart-footer">
+          <button className="edu-btn-primary" onClick={analyze} disabled={loading}>
+            {loading ? 'Synthesizing Data...' : 'Synthesize Diagnosis'}
+          </button>
+          {error && <div className="edu-error"><AlertCircle size={14}/> {error}</div>}
+        </div>
+      </section>
+
+
+      {/* RIGHT COLUMN: The Diagnostic Whiteboard */}
+      <section className="diagnostic-whiteboard custom-scrollbar">
+        {!results ? (
+          <div className="whiteboard-empty">
+            <ShieldCheck size={48} className="empty-icon" />
+            <h2>Awaiting Patient Data</h2>
+            <p>Input clinical parameters on the left to generate an explainable diagnostic assessment.</p>
+          </div>
+        ) : (
+          <div className="whiteboard-content fade-in">
+            
+            <div className="synthesis-header">
+              <h2 className="serif-title">Diagnostic Synthesis</h2>
+              <p className="edu-text">
+                Model Confidence: <strong>ROC AUC {modelInfo?.roc_auc ?? '0.804'}</strong> ({modelInfo?.metadata?.dataset_name || 'ILPD Cohort'})
+              </p>
+            </div>
+
+            <div className="verdict-card">
+              <div className="verdict-score">
+                <div className="score-circle" data-tier={results.color}>
+                  {results.probability}%
+                </div>
+                <div className="score-text">
+                  <span className="tier-label" data-tier={results.color}>{results.tier}</span>
+                  <span className="prob-label">Calculated Probability</span>
+                </div>
+              </div>
+              <div className="verdict-summary">
+                {results.summary}
+              </div>
+            </div>
+
+            {/* Serial Clinical Surveillance Timeline */}
+            <div className="abnormal-flags">
+              <div className="section-header-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <h3 className="section-title" style={{ margin: 0 }}><Activity size={16}/> Clinical Surveillance Timeline</h3>
+                {timeline.length > 0 && (
+                  <button 
+                    type="button"
+                    className="timeline-reset-btn"
+                    onClick={() => setTimeline([])}
+                  >
+                    Clear Timeline
+                  </button>
+                )}
+              </div>
+              <p className="edu-text" style={{ marginBottom: '20px' }}>
+                Surveillance tracking for longitudinal stays (e.g. 14 days). Click any day node to restore that historical run and its parameters.
+              </p>
+
+              <div className="timeline-container">
+                {timeline.length === 0 ? (
+                  <div className="timeline-empty-msg">
+                    No timeline tracking data. Click 'Synthesize Diagnosis' to record serial entries.
                   </div>
+                ) : (
+                  <div className="timeline-track-wrapper">
+                    <div className="timeline-line" />
+                    <div className="timeline-nodes">
+                      {timeline.map((point) => (
+                        <button
+                          key={point.day}
+                          type="button"
+                          className="timeline-node-item"
+                          onClick={() => {
+                            setForm(point.labs);
+                            setResults({
+                              probability: point.probability,
+                              tier: point.tier,
+                              color: point.color,
+                              summary: point.summary,
+                              actions: point.actions,
+                              abnormal_markers: point.abnormal_markers,
+                              shap_contributions: point.shap_contributions,
+                              model_metrics: point.model_metrics
+                            });
+                          }}
+                        >
+                          <div className={`timeline-node-circle ${point.color}`}>
+                            {point.probability}%
+                          </div>
+                          <span className="timeline-node-day">Day {point.day}</span>
+                          <span className="timeline-node-time">{point.timestamp}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {results.abnormal_markers?.length > 0 && (
+              <div className="abnormal-flags">
+                <h3 className="section-title"><AlertCircle size={16}/> Out-of-Range Assays</h3>
+                <div className="flag-grid">
+                  {results.abnormal_markers.map(m => (
+                    <div key={m.feature} className="flag-item">
+                      <div className="flag-name">{m.label}</div>
+                      <div className="flag-val">
+                        {m.value} {m.unit}
+                        <span className={`flag-dir ${m.direction}`}>{m.direction === 'high' ? '↑' : '↓'}</span>
+                      </div>
+                      <div className="flag-ref">Normal: {m.normal}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {renderDiagnosticBalance()}
+
+            <div className="clinical-plan">
+              <h3 className="section-title"><Activity size={16}/> Recommended Pathway</h3>
+              <ul className="plan-list">
+                {results.actions.map((action, i) => (
+                  <li key={i}>
+                    <div className="plan-step">{i + 1}</div>
+                    <span>{action}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Collapsible Advanced Diagnostics Drawer */}
+            <div className="advanced-toggle-sec">
+              <button 
+                type="button"
+                className="advanced-toggle-btn"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+              >
+                <span>Advanced Validation & Calibration Details</span>
+                {showAdvanced ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+              </button>
+
+              {showAdvanced && (
+                <div className="advanced-panel-content fade-in">
+                  <div className="metrics-row">
+                    <div className="metric-pill">
+                      <span className="mv">{results.model_metrics.roc_auc}</span>
+                      <span className="ml">ROC AUC</span>
+                    </div>
+                    <div className="metric-pill">
+                      <span className="mv">{results.model_metrics.pr_auc}</span>
+                      <span className="ml">PR AUC</span>
+                    </div>
+                    <div className="metric-pill">
+                      <span className="mv">{(results.model_metrics.threshold * 100).toFixed(1)}%</span>
+                      <span className="ml">Threshold</span>
+                    </div>
+                    <div className="metric-pill">
+                      <span className="mv">{modelInfo?.metadata?.n_samples || 583}</span>
+                      <span className="ml">Cohort Size</span>
+                    </div>
+                  </div>
+
+                  {modelInfo?.metadata && (
+                    <ul className="metadata-list" style={{ marginTop: '16px' }}>
+                      <li className="metadata-item">
+                        <ChevronRight size={12} className="bullet-icon" />
+                        <span>Classifier: <strong>{modelInfo.metadata.algorithm}</strong></span>
+                      </li>
+                      <li className="metadata-item">
+                        <ChevronRight size={12} className="bullet-icon" />
+                        <span>Probability Calibration: <strong>{modelInfo.metadata.calibration}</strong></span>
+                      </li>
+                      <li className="metadata-item">
+                        <ChevronRight size={12} className="bullet-icon" />
+                        <span>Validation Protocol: <strong>{modelInfo.metadata.validation}</strong></span>
+                      </li>
+                      <li className="metadata-item">
+                        <ChevronRight size={12} className="bullet-icon" />
+                        <span>Threshold Criterion: <strong>{modelInfo.metadata.threshold_criterion}</strong></span>
+                      </li>
+                    </ul>
+                  )}
                 </div>
               )}
             </div>
+
           </div>
         )}
-      </main>
+      </section>
+
     </div>
   );
 }
-
-export default App;

@@ -1,75 +1,72 @@
-# HepSense: Modular Clinical Decision Support System (CDSS)
+# HEPSENSE V3: Clinical Decision Support System (CDSS)
 
-**An AI-driven Risk Stratification System for Early Liver Failure Prediction**
-
-<div align="center">
-  <em>Shifting the clinical paradigm from static "disease staging" to dynamic, longitudinal future prediction.</em>
-</div>
-
----
-
-## 📖 Table of Contents
-- [Project Overview](#-project-overview)
-- [The Clinical Problem](#-the-clinical-problem)
-- [System Architecture](#-system-architecture)
-  - [1. Vision Expert (DANN + DenseNet121)](#1-vision-expert-dann--densenet121)
-  - [2. Clinical Temporal Expert (T-MELD)](#2-clinical-temporal-expert-t-meld)
-  - [3. Decision-Level Fusion Engine](#3-decision-level-fusion-engine)
-- [Results & Performance](#-results--performance)
-- [Getting Started](#-getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation & Setup](#installation--setup)
-- [Running the System](#-running-the-system)
-- [Expected Outcomes & Impact](#-expected-outcomes--impact)
+**An Explainable AI-driven Risk Stratification System for Liver Disease & Longitudinal Surveillance**
 
 ---
 
 ## 🧬 Project Overview
-
-Liver cirrhosis is the 11th leading cause of death globally (over 1.3 million deaths annually). 
-**HepSense** is designed as a multi-modal framework that integrates both computer vision (for medical imaging analysis) and time-series extraction (for longitudinal electronic health records) to provide a holistic, dynamic risk assessment of liver cirrhosis. It acts as a temporal AI "early warning radar" to reduce preventable ICU mortality by predicting acute decompensation events before they occur.
-
-## ⚠️ The Clinical Problem
-
-Current clinicians rely on outdated, static scoring equations (e.g., MELD-Na, FIB-4). 
-* **Snapshot Bias:** Static scores analyze a single day's blood test, creating a dangerous bias that misses declining patient trajectories.
-* **Blind Spots:** Clinicians are often blind to impending, fatal crises like variceal hemorrhage or encephalopathy.
-* **Reactive vs. Proactive:** Most existing models predict mortality *after* a patient enters critical condition in the ICU. HepSense bridges this gap by forecasting the actual future onset of an emergency.
+HepSense V3 is a medical-grade **Clinical Decision Support System (CDSS)** designed to predict the likelihood of liver disease and monitor patient trajectories longitudinally. It bridges the gap between raw biochemical laboratory test results and clinical action by combining:
+1. An **Optuna-optimized XGBoost classifier** trained on the Indian Liver Patient Dataset (ILPD) and calibrated with **Platt Scaling** to output true clinical probabilities.
+2. **SHAP Pathological Weighting** to provide transparent, explainable feature attributions at the point of care.
+3. A **Serial Clinical Surveillance Timeline** that allows doctors to track risk trajectory day-by-day (e.g., over a 14-day stay) and restore past daily configurations with a single click.
 
 ---
 
-## 🏗 System Architecture
-
-HepSense uses a **"Chief Medical Officer" approach**, deploying independent AI experts and unifying them via decision-level fusion.
-
-### 1. Vision Expert (DANN + DenseNet121)
-A deep learning computer vision model built to classify the progression of liver cirrhosis stages (F0 to F4) from 2D B-mode ultrasound imaging.
-* **Architecture:** `DenseNet121` feature extractor integrated with a **Domain-Adversarial Neural Network (DANN)**. 
-* **Texture over Artifacts:** The DANN framework utilizes a Gradient Reversal Layer (GRL) to force the network to map structural parenchyma texture rather than variations in machine calibration or acoustic gain.
-* **Explainable AI:** Grad-CAM heatmaps highlight cirrhotic nodules to verify that the network focuses on anatomical pathology.
-
-### 2. Clinical Temporal Expert (T-MELD)
-A quantitative data-mining structure utilizing multi-modal clinical histories to capture the velocity and acceleration of a patient's decline.
-* **Temporal Engineering:** Extracts 34 longitudinal features using `tsfresh` to calculate biomarker velocity (e.g., the rate of bilirubin increase).
-* **Predictive Modeling:** Time-Series Gradient Boosted Trees (`XGBoost`) optimized via `Optuna` and calibrated with Isotonic Regression.
-* **Explainability (XAI):** Employs SHAP (SHapley Additive exPlanations) values to visualize feature importance, ensuring absolute medical transparency and physician trust.
-
-### 3. Decision-Level Fusion Engine
-The integration layer written in `FastAPI`. It merges the probabilistic outputs of the Vision and Temporal experts. It incorporates rule-based safety nets to catch clinical discordance (e.g., flagging a high-risk alert if a patient has an F0 liver image but rapidly accelerating lab failure trends).
+## ⚠️ The Clinical Problem & Motivation
+Traditional clinical models for liver function assessment (like standard LFT scores) suffer from:
+* **Snapshot Bias:** Analyzing a single day's blood draw ignores the trajectory and rate of change of the patient's condition.
+* **Lack of Transparency:** Many clinical machine learning models operate as "black boxes," providing scores without explaining which biological markers drove the prediction.
+* **Static Scoring Limitations:** Traditional metrics lack dynamic patient surveillance. HepSense V3 tracks changes day-by-day, visualizes risk progression, and isolates critical abnormalities.
 
 ---
 
-## 📊 Results & Performance
+## 🏗️ System Architecture
 
-* **Vision Pipeline:** Achieved **98.66% validation accuracy** across the 5-stage fibrosis dataset, with a 0.97 F1-score discriminating F2 vs. F3 stages.
-* **Clinical Pipeline (T-MELD):** Achieved an **AUROC of 0.6891**, statistically outperforming the standard MELD baseline of 0.6834 on highly imbalanced clinical cohorts. Negative Predictive Value securely clears stable patients with 98% precision.
+### 1. Machine Learning Pipeline (`train_ilpd.py`)
+* **Cohort Profile**: Trained on the UCI Indian Liver Patient Dataset (583 patients, 10 clinical features).
+* **Optimization Protocol**: XGBoost Classifier tuned via a 60-trial **Optuna Bayesian optimization** study with 5-fold Stratified Cross-Validation.
+* **Calibration Mapping**: Calibrated using **Platt Scaling** (Sigmoid calibration) so output risk probabilities match actual empirical disease likelihood.
+* **Decision Boundary**: Optimized using **Youden’s J statistic** (optimal decision threshold: **0.7017**).
+* **Performance**:
+  - **Test ROC AUC**: **0.8044** (extremely strong discriminative power).
+  - **Test PR AUC**: **0.9147**
+
+### 2. FastAPI Backend (`backend/api.py`)
+* **`GET /health`**: Enriched endpoint returning API status, active features, and complete clinical validation metadata dynamically.
+* **`POST /predict`**: Accepts patient vitals and LFT values, checks normal ranges, computes the risk score, generates dynamic recommendations, and runs the SHAP explainer for attributions.
+
+### 3. Academic Whiteboard UI (`frontend/src/App.jsx`)
+* **Patient Chart (Left Sidebar)**: Input form supporting demographics, clinical reference case presets (Standard Baseline, Hepatitis Pattern, Advanced Cirrhosis), and full LFT inputs.
+* **Diagnostic Whiteboard (Right Panel)**: Displays risk scores, abnormal laboratory flags, and recommended clinical actions.
+* **Pathological Weighting**: Visual balance scale showing how each biomarker tilts the diagnosis toward healthy or pathological.
+* **Serial Surveillance Timeline**: Stores sequential assessments (e.g. Day 1 &rarr; Day 14), enabling physicians to map out patient progression and click any node to restore historical lab values.
+
+---
+
+## 📂 Directory Structure
+```
+EarlyLiverFailurePrediction/
+├── backend/
+│   └── api.py                  # FastAPI Server
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx             # React Dashboard Layout & Timeline Track
+│   │   └── index.css           # Academic Lora + Inter Theme Styling
+│   ├── package.json
+│   └── vite.config.js          # API Proxy configuration
+├── ILPD/
+│   └── indian_liver_patient.csv # Source Patient Cohort
+├── ilpd_model_pkg.joblib       # Joblib Package (Model, Medians, Explainer)
+├── train_ilpd.py               # XGBoost + Optuna Training Pipeline
+├── pyproject.toml
+└── requirements.txt
+```
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-
 * Python >= 3.12
 * Node.js (v18+) & `npm`
 * `uv` package manager
@@ -83,13 +80,13 @@ The integration layer written in `FastAPI`. It merges the probabilistic outputs 
    ```
 
 2. **Backend Setup:**
-   Sync the Python environment to install PyTorch, XGBoost, FastAPI, and other dependencies.
+   Install PyTorch, XGBoost, SHAP, FastAPI, and other dependencies:
    ```bash
    uv sync
    ```
 
 3. **Frontend Setup:**
-   Install the React.js dependencies.
+   Install npm packages:
    ```bash
    cd frontend
    npm install
@@ -99,30 +96,17 @@ The integration layer written in `FastAPI`. It merges the probabilistic outputs 
 
 ## 💻 Running the System
 
-The HepSense platform requires running the FastAPI backend and the React frontend concurrently.
-
 1. **Start the API Server:**
    From the project root:
    ```bash
-   cd backend
-   python -m uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+   .venv\Scripts\python.exe -m uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload
    ```
 
 2. **Launch the Clinical Dashboard:**
    In a new terminal:
    ```bash
    cd frontend
-   npm run dev
+   $env:PATH = "C:\nvm4w\nodejs;$env:PATH"; npm run dev
    ```
 
-Access the dashboard at `http://localhost:5173`. 
-
-*(Note: Production model weights and raw datasets are securely tracked outside of this repository due to size constraints. Ensure you have the `.pth` and `.joblib` artifacts in the root folder before inferencing).*
-
----
-
-## 🎯 Expected Outcomes & Impact
-
-* **Performance Shift:** Establishing proven, quantitative superiority over the static MELD clinical score.
-* **Clinical Impact:** Empowers hepatologists to schedule preemptive, prophylactic interventions safely (e.g., executing an endoscopy before a fatal hemorrhage occurs), optimizing hospital triage resources.
-* **Trust & Transparency:** Decision-level fusion combined with SHAP and Grad-CAM directly tackles the "black box" liability of medical AI, prioritizing explainability for clinical deployment.
+Access the dashboard in your browser at `http://localhost:5173`.

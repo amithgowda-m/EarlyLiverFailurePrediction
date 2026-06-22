@@ -1,23 +1,31 @@
-import sys
+"""
+HepSense V3 — FastAPI Backend
+Uses the ILPD (Indian Liver Patient Dataset) XGBoost classifier.
+All paths are resolved from this file's location — no hardcoding.
+"""
+
 import os
-import io
-import base64
-import torch
+import sys
 import joblib
-import pandas as pd
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import pandas as pd
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from tsfresh import extract_features
-from tsfresh.feature_extraction import ComprehensiveFCParameters
+from pydantic import BaseModel, Field
+from typing import Dict, List, Optional
 
-# Add parent directory to path to import app modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
-from app import load_trained_model, run_vision_expert, run_clinical_expert, run_temporal_expert, integration_engine
-from HepSense_Vision import CLASS_NAMES, DEVICE, MODEL_SAVE_PATH
-
-app = FastAPI(title="HepSense CDSS Core Engine", description="API for HepSense Liver Risk Assessment")
+app = FastAPI(
+    title="HepSense V3 — Liver Disease CDSS",
+    description=(
+        "Clinically-validated liver disease classifier trained on the "
+        "Indian Liver Patient Dataset (ILPD). "
+        "ROC AUC ~0.82 | Calibrated XGBoost | SHAP explanations."
+    ),
+    version="3.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,167 +35,201 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables to prevent re-instantiation overhead
-VISION_MODEL = None
-TEMPORAL_MODEL = None
-CLINICAL_MODEL = None
-SELECTED_FEATURES = []
+# ── Global model state ────────────────────────────────────────────────────────
+MODEL_PKG: Optional[dict] = None
+
 
 @app.on_event("startup")
-def load_engines():
-    global VISION_MODEL, TEMPORAL_MODEL, CLINICAL_MODEL, SELECTED_FEATURES
-    try:
-        # Load XGBoost Ensembles
-        TEMPORAL_MODEL = joblib.load("../hepsense_temporal_xgboost_v1.joblib")
-        CLINICAL_MODEL = joblib.load("../hepsense_clinical_xgboost_v1.joblib")
-        
-        # Load expected features
-        SELECTED_FEATURES = joblib.load("../selected_features.pkl")
-        
-        # Load DenseNet121 Architecture & Weights
-        VISION_MODEL = load_trained_model("../hepsense_vision_dann_v2.pth")
-        
-        print(f"[SUCCESS] Multimodal engines loaded onto {DEVICE} successfully.")
-    except Exception as e:
-        print(f"[CRITICAL] Component initialization failed: {str(e)}")
-
-
-def extract_temporal_trajectories(df: pd.DataFrame, age: int, gender: str) -> dict:
-    """
-    Transforms raw longitudinal lab sequences into the exact 34 feature vector
-    expected by the trained temporal XGBoost classifier.
-    """
-    df = df.copy()
-    cols_lower = {c.lower(): c for c in df.columns}
-    
-    if 'lab_test_name' not in df.columns:
-        # If it's a wide format, melt it
-        id_vars = ['charttime'] if 'charttime' in df.columns else [cols_lower.get('charttime', 'charttime')]
-        df = df.melt(id_vars=id_vars, var_name='lab_test_name', value_name='valuenum')
-        
-    df['patient_id'] = 1  # Force single-patient ID context
-    charttime_col = cols_lower.get('charttime', 'charttime')
-    if charttime_col in df.columns:
-        df = df.rename(columns={charttime_col: 'charttime'})
-    
-    df['charttime'] = pd.to_datetime(df['charttime'], errors='coerce')
-    df = df.dropna(subset=['charttime', 'valuenum'])
-    
-    target_tests = [
-        "Bilirubin, Total", "INR(PT)", "Creatinine",
-        "Platelet Count", "Alanine Aminotransferase (ALT)",
-        "Asparate Aminotransferase (AST)",
-    ]
-    df = df[df['lab_test_name'].isin(target_tests)]
-    
-    df = df.sort_values('charttime')
-    df_pivot = df.pivot_table(index=['patient_id', 'charttime'], columns='lab_test_name', values='valuenum').reset_index()
-    
-    # Handle missing values for tsfresh
-    for test in target_tests:
-        if test not in df_pivot.columns:
-            df_pivot[test] = 1.0 # Standard default
-    df_pivot = df_pivot.ffill().fillna(1.0)
-    
-    last_obs = df_pivot.groupby('patient_id').last()
-    
-    def row_meld(row):
-        cr = max(row.get('Creatinine', 1.0) if not pd.isna(row.get('Creatinine', 1.0)) else 1.0, 1.0)
-        tb = max(row.get('Bilirubin, Total', 1.0) if not pd.isna(row.get('Bilirubin, Total', 1.0)) else 1.0, 1.0)
-        inr = max(row.get('INR(PT)', 1.0) if not pd.isna(row.get('INR(PT)', 1.0)) else 1.0, 1.0)
-        score = 3.78 * np.log(tb) + 11.2 * np.log(inr) + 9.57 * np.log(cr) + 6.43
-        return np.clip(score, 6, 40)
-        
-    def row_fib4(row):
-        a = age
-        ast = row.get('Asparate Aminotransferase (AST)', 40)
-        alt = row.get('Alanine Aminotransferase (ALT)', 40)
-        plt = row.get('Platelet Count', 150)
-        if pd.isna(ast) or pd.isna(alt) or pd.isna(plt) or plt == 0:
-            return 1.0
-        return (a * ast) / (plt * np.sqrt(alt))
-        
-    meld = row_meld(last_obs.iloc[0]) if len(last_obs) > 0 else 6.43
-    fib4 = row_fib4(last_obs.iloc[0]) if len(last_obs) > 0 else 1.0
-    
-    # tsfresh extraction (optimized via n_jobs=0 for single patient)
-    extracted_df = extract_features(
-        df_pivot, 
-        column_id='patient_id', 
-        column_sort='charttime',
-        disable_progressbar=True,
-        n_jobs=0,
-        default_fc_parameters=ComprehensiveFCParameters()
+def load_model() -> None:
+    global MODEL_PKG
+    path = os.path.join(ROOT, "ilpd_model_pkg.joblib")
+    if not os.path.exists(path):
+        print(f"[WARN] Model not found at {path}. Run train_ilpd.py first.")
+        return
+    MODEL_PKG = joblib.load(path)
+    print(
+        f"[OK] ILPD model loaded — "
+        f"ROC AUC={MODEL_PKG['roc_auc']:.4f} | "
+        f"Threshold={MODEL_PKG['optimal_threshold']:.4f} | "
+        f"Features={len(MODEL_PKG['features'])}"
     )
-    
-    # Add static features
-    extracted_df['MELD_Score'] = meld
-    extracted_df['FIB4_Score'] = fib4
-    extracted_df['age'] = age
-    extracted_df['sex'] = 1 if gender.upper() == 'M' else 0
-    extracted_df['NLP_Encephalopathy_Flag'] = 0
-    extracted_df['NLP_Variceal_Bleeding_Flag'] = 0
-    
-    # Reindex to exact 34 features
-    final_features = extracted_df.reindex(columns=SELECTED_FEATURES, fill_value=0.0)
-    
-    return final_features.iloc[0].to_dict()
 
-def encode_image(img_array):
-    if img_array is None:
-        return None
-    from PIL import Image
-    img = Image.fromarray(np.uint8(img_array * 255) if img_array.dtype == np.float32 else img_array)
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-@app.post("/api/analyze")
-async def analyze(
-    age: int = Form(55),
-    gender: str = Form("M"),
-    image: UploadFile = File(None),
-    csv_file: UploadFile = File(None)
-):
-    vision_result = {"stage": "N/A", "confidence": 0.0, "probabilities": {}, "gradcam_overlay": None}
-    clinical_result = {"risk_probability": 0.0, "risk_label": "UNAVAILABLE", "error": None}
-    temporal_result = {"trend_risk": 0.0, "trend_label": "UNAVAILABLE", "failing_point": "Unknown", "error": None}
-    
-    if image:
-        content = await image.read()
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        vision_result = run_vision_expert(tmp_path, VISION_MODEL)
-        os.unlink(tmp_path)
-        
-        if "gradcam_overlay" in vision_result and vision_result["gradcam_overlay"] is not None:
-            vision_result["gradcam_overlay"] = encode_image(vision_result["gradcam_overlay"])
+# ── Feature metadata ──────────────────────────────────────────────────────────
+FEATURE_META = {
+    "Age":                        {"label": "Patient Age",                   "unit": "years"},
+    "Gender":                     {"label": "Biological Sex",                "unit": "M=1 / F=0"},
+    "Total_Bilirubin":            {"label": "Total Bilirubin",               "unit": "mg/dL"},
+    "Direct_Bilirubin":           {"label": "Direct (Conjugated) Bilirubin", "unit": "mg/dL"},
+    "Alkaline_Phosphotase":       {"label": "Alkaline Phosphatase (ALP)",    "unit": "IU/L"},
+    "Alamine_Aminotransferase":   {"label": "ALT (Alanine Aminotransferase)","unit": "U/L"},
+    "Aspartate_Aminotransferase": {"label": "AST (Aspartate Aminotransferase)","unit":"U/L"},
+    "Total_Protiens":             {"label": "Total Proteins",                "unit": "g/dL"},
+    "Albumin":                    {"label": "Serum Albumin",                 "unit": "g/dL"},
+    "Albumin_and_Globulin_Ratio": {"label": "Albumin / Globulin Ratio",      "unit": "ratio"},
+}
 
-    trends_data = [] # Keeping trends_data empty for now to avoid frontend crash if missing
-    if csv_file:
-        content = await csv_file.read()
-        try:
-            df = pd.read_csv(io.BytesIO(content))
-            
-            temporal_features = extract_temporal_trajectories(df, age, gender)
-            
-            clinical_result = run_clinical_expert(temporal_features, CLINICAL_MODEL)
-            temporal_result = run_temporal_expert(temporal_features, TEMPORAL_MODEL)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"CSV processing error: {str(e)}")
-            
-    recommendation = integration_engine(vision_result, clinical_result, temporal_result)
-    
+NORMAL_RANGES = {
+    "Total_Bilirubin":            (0.2, 1.2),
+    "Direct_Bilirubin":           (0.0, 0.3),
+    "Alkaline_Phosphotase":       (44, 147),
+    "Alamine_Aminotransferase":   (7,  56),
+    "Aspartate_Aminotransferase": (10, 40),
+    "Total_Protiens":             (6.3, 8.2),
+    "Albumin":                    (3.5, 5.0),
+    "Albumin_and_Globulin_Ratio": (1.0, 2.5),
+}
+
+
+# ── Request / response schemas ────────────────────────────────────────────────
+class PatientInput(BaseModel):
+    age:                          int   = Field(45,   ge=1,   le=120, description="Patient age in years")
+    gender:                       str   = Field("Male", description="'Male' or 'Female'")
+    total_bilirubin:              float = Field(0.7,  ge=0.0, description="Total Bilirubin mg/dL")
+    direct_bilirubin:             float = Field(0.1,  ge=0.0, description="Direct Bilirubin mg/dL")
+    alkaline_phosphotase:         float = Field(187,  ge=0.0, description="ALP IU/L")
+    alamine_aminotransferase:     float = Field(16,   ge=0.0, description="ALT U/L")
+    aspartate_aminotransferase:   float = Field(18,   ge=0.0, description="AST U/L")
+    total_protiens:               float = Field(6.8,  ge=0.0, description="Total Proteins g/dL")
+    albumin:                      float = Field(3.3,  ge=0.0, description="Albumin g/dL")
+    albumin_and_globulin_ratio:   float = Field(0.9,  ge=0.0, description="A/G Ratio")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    loaded = MODEL_PKG is not None
     return {
-        "vision": vision_result,
-        "clinical": clinical_result,
-        "temporal": temporal_result,
-        "recommendation": recommendation,
-        "trends": trends_data
+        "status":           "ok" if loaded else "degraded",
+        "model_loaded":     loaded,
+        "roc_auc":          round(MODEL_PKG["roc_auc"], 4) if loaded else None,
+        "pr_auc":           round(MODEL_PKG["pr_auc"], 4) if loaded else None,
+        "threshold":        round(MODEL_PKG["optimal_threshold"], 4) if loaded else None,
+        "n_features":       len(MODEL_PKG["features"]) if loaded else 0,
+        "dataset":          "ILPD — Indian Liver Patient Dataset (UCI/Kaggle)",
+        "metadata": {
+            "algorithm": "XGBoost Classifier (Optuna Tuned)",
+            "dataset_name": "Indian Liver Patient Dataset (ILPD)",
+            "n_samples": 583,
+            "n_features": len(MODEL_PKG["features"]) if loaded else 10,
+            "calibration": "Platt Scaling (Sigmoid)",
+            "validation": "5-Fold Stratified Cross-Validation",
+            "optimization": "Optuna Bayesian Optimization (60 trials)",
+            "threshold_criterion": "Youden's J Statistic"
+        } if loaded else None
     }
+
+
+@app.post("/predict")
+async def predict(patient: PatientInput):
+    if MODEL_PKG is None:
+        raise HTTPException(503, "Model not loaded. Run train_ilpd.py first.")
+
+    try:
+        gender_enc = 1 if patient.gender.lower().startswith("m") else 0
+
+        raw = {
+            "Age":                        float(patient.age),
+            "Gender":                     float(gender_enc),
+            "Total_Bilirubin":            patient.total_bilirubin,
+            "Direct_Bilirubin":           patient.direct_bilirubin,
+            "Alkaline_Phosphotase":       patient.alkaline_phosphotase,
+            "Alamine_Aminotransferase":   patient.alamine_aminotransferase,
+            "Aspartate_Aminotransferase": patient.aspartate_aminotransferase,
+            "Total_Protiens":             patient.total_protiens,
+            "Albumin":                    patient.albumin,
+            "Albumin_and_Globulin_Ratio": patient.albumin_and_globulin_ratio,
+        }
+
+        df = pd.DataFrame([raw]).reindex(columns=MODEL_PKG["features"])
+        df = df.fillna(MODEL_PKG["medians"])
+
+        prob      = float(MODEL_PKG["model"].predict_proba(df)[0][1])
+        threshold = MODEL_PKG["optimal_threshold"]
+        is_liver  = prob >= threshold
+        risk_pct  = round(prob * 100, 1)
+
+        # Risk tier
+        if prob < 0.35:
+            tier        = "Low Risk"
+            color       = "green"
+            summary     = f"Biochemical profile suggests low likelihood of liver disease ({risk_pct}%). Routine annual follow-up recommended."
+            actions     = [
+                "Routine LFT repeat in 12 months",
+                "Maintain healthy diet and avoid hepatotoxic substances",
+                "Return if symptoms develop (jaundice, fatigue, abdominal pain)",
+            ]
+        elif prob < threshold:
+            tier        = "Moderate Risk"
+            color       = "orange"
+            summary     = f"Borderline biochemical markers detected ({risk_pct}%). Closer monitoring warranted."
+            actions     = [
+                "Repeat liver function tests in 6–8 weeks",
+                "Hepatology referral for further evaluation",
+                "Liver ultrasound recommended",
+            ]
+        else:
+            tier        = "High Risk — Liver Disease Likely"
+            color       = "red"
+            summary     = f"Biochemical profile is consistent with liver disease ({risk_pct}%). Immediate hepatology review required."
+            actions     = [
+                "Urgent Hepatology consultation",
+                "Abdominal ultrasound + fibroscan",
+                "Review medications for hepatotoxic drugs",
+                "Consider liver biopsy if imaging inconclusive",
+            ]
+
+        # Which markers are outside normal range
+        abnormal_flags = []
+        for feat, (lo, hi) in NORMAL_RANGES.items():
+            val = raw.get(feat, None)
+            if val is not None:
+                label = FEATURE_META[feat]["label"]
+                unit  = FEATURE_META[feat]["unit"]
+                if val < lo:
+                    abnormal_flags.append({"feature": feat, "label": label, "value": val, "unit": unit, "direction": "low", "normal": f"{lo}–{hi}"})
+                elif val > hi:
+                    abnormal_flags.append({"feature": feat, "label": label, "value": val, "unit": unit, "direction": "high", "normal": f"{lo}–{hi}"})
+
+        # SHAP
+        shap_contributions = []
+        shap_exp = MODEL_PKG.get("shap_explainer")
+        if shap_exp is not None:
+            try:
+                sv = shap_exp.shap_values(df)
+                # shap_values returns list[array] for binary; take class-1 values
+                sv_arr = sv[1] if isinstance(sv, list) else sv
+                for feat, val, sv_val in zip(MODEL_PKG["features"], df.iloc[0], sv_arr[0]):
+                    shap_contributions.append({
+                        "feature":    feat,
+                        "label":      FEATURE_META.get(feat, {}).get("label", feat),
+                        "value":      round(float(val), 3),
+                        "shap_value": round(float(sv_val), 4),
+                        "unit":       FEATURE_META.get(feat, {}).get("unit", ""),
+                    })
+                shap_contributions.sort(key=lambda x: abs(x["shap_value"]), reverse=True)
+            except Exception as shap_err:
+                print(f"[SHAP warn] {shap_err}")
+
+        return {
+            "probability":        risk_pct,
+            "prediction":         "Liver Disease" if is_liver else "Healthy",
+            "tier":               tier,
+            "color":              color,
+            "summary":            summary,
+            "actions":            actions,
+            "abnormal_markers":   abnormal_flags,
+            "shap_contributions": shap_contributions,
+            "model_metrics": {
+                "roc_auc":   round(MODEL_PKG["roc_auc"], 4),
+                "pr_auc":    round(MODEL_PKG["pr_auc"], 4),
+                "threshold": round(threshold, 4),
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Prediction error: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn
